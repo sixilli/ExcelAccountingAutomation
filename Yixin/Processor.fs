@@ -24,6 +24,22 @@ module Processor =
         cleanVal = "total all location" ||
         cleanVal.Contains("(all)")
         
+    let walkRows (ws : IXLWorksheet) fn =
+        let phaseLoc = 1
+        
+        let mutable it = ws.FirstRowUsed()
+        // Skip first chunk of data as it's not useful
+        while (it.Cell(phaseLoc).Value.GetText().Trim() <> "ALL LOCATION") do
+            it <- it.RowBelow()
+        it <- it.RowBelow()
+            
+        while not (it.Cell(phaseLoc).IsEmpty()) do
+            let fullPhase = it.Cell(phaseLoc).Value.GetText().Trim()
+            if not (shouldSkip fullPhase) then
+                fn it
+                
+            it <- it.RowBelow()
+        
     let walkPhases (ws : IXLWorksheet) fn =
         let phaseLoc = 1
         let amountLoc = 2
@@ -190,7 +206,8 @@ module Processor =
         
         let createInvoiceFormula (address : IXLAddress) =
             let sheet = address.Worksheet.Name
-            $"""=TRIM(RIGHT(SUBSTITUTE(TRIM('{sheet}'!{address})," ",REPT(" ",99)),99))"""
+            //$"""=TRIM(RIGHT(SUBSTITUTE(TRIM('{sheet}'!{address})," ",REPT(" ",99)),99))"""
+            $"='{sheet}'!{address}"
         
         let workFn phaseId _ =
             if (invoiceMap.ContainsKey phaseId) then
@@ -260,6 +277,23 @@ module Processor =
                 
     let searchForExcelFiles directory =
         Directory.GetFiles(directory, "*.xlsx")
+        
+    let applySumFormula ws =
+        let actualColNum = 2
+        let totalColNum = 3
+        let firstInvoiceAmountColNum = 4
+        
+        walkRows ws (fun row ->
+            if row.Cell(actualColNum).Value.IsNumber then
+                match row.Cell(actualColNum).Value.GetNumber() with
+                | 0.0 -> row.Cell(totalColNum).Value <- 0.00
+                | _ ->
+                    let totalCell = row.Cell(totalColNum)
+                    let firstEntry = row.Cell(firstInvoiceAmountColNum).Address
+                    let lastEntry = row.LastCellUsed().Address
+                    totalCell.FormulaA1 <- $"=SUM({firstEntry}:{lastEntry})"
+        )
+        
     let run () =
         let dir = Directory.GetCurrentDirectory()
         let files = searchForExcelFiles dir
@@ -276,6 +310,7 @@ module Processor =
         let nonZeroMap = collectNonZeroEntries reportSheet
         let invoiceMap = findRelatedInvoices glSheet nonZeroMap
         updateReport reportSheet invoiceMap
+        applySumFormula reportSheet
         
         let fileName = "sheet-builder-output.xlsx"
         let fileFull = Path.Join(dir, fileName)
