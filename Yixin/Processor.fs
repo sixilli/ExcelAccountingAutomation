@@ -16,6 +16,15 @@ module Processor =
     type PhaseWrapper =
         { phaseLoc: IXLAddress
           invoiceData: InvoiceData list }
+        
+    [<Literal>]
+    let ActualAmountColNum = 2
+    [<Literal>]
+    let InvoiceTotalColNum = 3
+    [<Literal>]
+    let InvoiceDiffColNum = 4
+    [<Literal>]
+    let FirstInvoiceColNum = 5
     // ending rows that are not needed
     let shouldSkip (phaseId : string) =
         let cleanVal = phaseId.ToLower()
@@ -124,8 +133,9 @@ module Processor =
                 fun (_, cells) ->
                     Seq.last cells
                     |> fun cellToRemove ->
+                       printfn $"Warning! found a duplicate '{cellToRemove.Value.ToString()}'column , will remove."
                        glWs.Column(cellToRemove.Address.ColumnNumber).Delete()
-                       printfn $"Warning! found a duplicate '{cellToRemove.Value.ToString()}'column , will remove.")
+                )
             
             // find last cell
             let phaseCell = headerRow.Search("Phase") |> Seq.head
@@ -198,51 +208,60 @@ module Processor =
        
         
     let updateReport (reportSheet : IXLWorksheet) (invoiceMap : Map<string, Map<string,PhaseWrapper>>) =
-        let invoiceStart = 4
-        let invoiceRow = 8
-        let vendorRow = 9
+        let invoiceStartCol, invoiceRow, vendorRow = 5, 8, 9
+        let mutable insertLoc = invoiceStartCol
         
-        let mutable insertLoc = invoiceStart
+        let createInvoiceFormula (address: IXLAddress) =
+            $"='{address.Worksheet.Name}'!{address}"
         
-        let createInvoiceFormula (address : IXLAddress) =
-            let sheet = address.Worksheet.Name
-            //$"""=TRIM(RIGHT(SUBSTITUTE(TRIM('{sheet}'!{address})," ",REPT(" ",99)),99))"""
-            $"='{sheet}'!{address}"
+        let formatCell (cell: IXLCell) =
+            cell.Style.NumberFormat.Format <- "#,##0.00"
+        
+        let setInvoiceFormula (cell: IXLCell) (invoice: InvoiceData) =
+            let sign = if invoice.amount < 0.0 then "-" else "+"
+            cell.FormulaA1 <- $"{sign}'{invoice.amountLocations.Head.Worksheet.Name}'!{invoice.amountLocations.Head}"
+        
+        let processInvoice (phaseRow: int) (invoice: InvoiceData) =
+            formatCell (reportSheet.Cell(phaseRow, insertLoc))
+            setInvoiceFormula (reportSheet.Cell(phaseRow, insertLoc)) invoice
+            reportSheet.Cell(vendorRow, insertLoc).Value <- invoice.vendor
+            reportSheet.Cell(invoiceRow, insertLoc).FormulaA1 <- createInvoiceFormula invoice.invoiceLocation
+            insertLoc <- insertLoc + 1
+        
+        let processMultipleInvoices (phaseRow: int) (invoices: seq<InvoiceData>) =
+            formatCell (reportSheet.Cell(phaseRow, insertLoc))
+            let formula = 
+                invoices
+                |> Seq.collect (fun invoice -> 
+                    invoice.amountLocations 
+                    |> Seq.map (fun loc -> 
+                        let sign = if invoice.amount < 0.0 then "-" else "+"
+                        $"{sign}'{loc.Worksheet.Name}'!{loc}"))
+                |> String.concat ""
+            reportSheet.Cell(phaseRow, insertLoc).FormulaA1 <- $"={formula.TrimStart('+')}"
+            
+            for invoice in invoices do
+                reportSheet.Cell(vendorRow, insertLoc).Value <- invoice.vendor
+                reportSheet.Cell(invoiceRow, insertLoc).FormulaA1 <- createInvoiceFormula invoice.invoiceLocation
+                insertLoc <- insertLoc + 1
         
         let workFn phaseId _ =
-            if (invoiceMap.ContainsKey phaseId) then
-                let vendorMap = invoiceMap[phaseId]
-                
-                vendorMap
+            if invoiceMap.ContainsKey phaseId then
+                invoiceMap[phaseId]
                 |> Map.toSeq
                 |> Seq.sortByDescending (fun (_, wrapper) -> wrapper.invoiceData.Length)
-                |> Seq.iter(fun (_, wrapper) ->
-                    let combinedInvoices = combineInvoices wrapper.invoiceData
+                |> Seq.iter (fun (_, wrapper) ->
                     let phaseRow = wrapper.phaseLoc.RowNumber
-                    List.iter (fun i ->
-                        match i.amountLocations.Length with
+                    wrapper.invoiceData
+                    |> Seq.groupBy (fun i -> i.id)
+                    |> Seq.iter (fun (_, invoices) ->
+                        match Seq.length invoices with
                         | 0 -> ()
-                        | 1 ->
-                            reportSheet.Cell(phaseRow, insertLoc).Style.NumberFormat.Format <- "#,##0.00"
-                            let loc = i.amountLocations.Head
-                            reportSheet.Cell(phaseRow, insertLoc).FormulaA1 <- $"='{loc.Worksheet.Name}'!{loc}"
-                            reportSheet.Cell(vendorRow, insertLoc).Value <- i.vendor
-                            reportSheet.Cell(invoiceRow, insertLoc).FormulaA1 <- (createInvoiceFormula i.invoiceLocation)
-                            insertLoc <- insertLoc + 1
-                        | _ ->
-                            reportSheet.Cell(phaseRow, insertLoc).Style.NumberFormat.Format <- "#,##0.00"
-                            let mutable formula = ""
-                            for loc in i.amountLocations do
-                                match formula with
-                                | "" -> formula <- formula + $"='{loc.Worksheet.Name}'!{loc}"
-                                | _ -> formula <- formula + $"+'{loc.Worksheet.Name}'!{loc}"
-                            reportSheet.Cell(phaseRow, insertLoc).FormulaA1 <- formula
-                            reportSheet.Cell(vendorRow, insertLoc).Value <- i.vendor
-                            reportSheet.Cell(invoiceRow, insertLoc).FormulaA1 <- (createInvoiceFormula i.invoiceLocation)
-                            insertLoc <- insertLoc + 1
-                    ) combinedInvoices )
+                        | 1 -> processInvoice phaseRow (Seq.head invoices)
+                        | _ -> processMultipleInvoices phaseRow invoices)) 
             
         walkPhases reportSheet workFn
+        
         // merge cells in the same row with the same value
         let mutable itStart = reportSheet.Row(9).Cell(4).Address
         let mutable itEnd = reportSheet.Row(9).LastCellUsed().Address
@@ -279,19 +298,24 @@ module Processor =
         Directory.GetFiles(directory, "*.xlsx")
         
     let applySumFormula ws =
-        let actualColNum = 2
-        let totalColNum = 3
-        let firstInvoiceAmountColNum = 4
+        
         
         walkRows ws (fun row ->
-            if row.Cell(actualColNum).Value.IsNumber then
-                match row.Cell(actualColNum).Value.GetNumber() with
-                | 0.0 -> row.Cell(totalColNum).Value <- 0.00
+            if row.Cell(ActualAmountColNum).Value.IsNumber then
+                match row.Cell(ActualAmountColNum).Value.GetNumber() with
+                | 0.0 -> row.Cell(InvoiceTotalColNum).Value <- 0.00
                 | _ ->
-                    let totalCell = row.Cell(totalColNum)
-                    let firstEntry = row.Cell(firstInvoiceAmountColNum).Address
+                    let firstEntry = row.Cell(FirstInvoiceColNum).Address
                     let lastEntry = row.LastCellUsed().Address
-                    totalCell.FormulaA1 <- $"=SUM({firstEntry}:{lastEntry})"
+                    let range = ws.Range(firstEntry, lastEntry)
+                    
+                    let calculatedTotal = Seq.fold (fun acc (cell : IXLCell) -> acc + cell.Value.GetNumber()) 0.0 (range.CellsUsed())
+                    row.Cell(InvoiceTotalColNum).Value <- calculatedTotal
+                    row.Cell(InvoiceTotalColNum).FormulaA1 <- $"=SUM({firstEntry}:{lastEntry})"
+                    
+                    if calculatedTotal <> 0.0 then
+                        let actualTotalCell = row.Cell(ActualAmountColNum)
+                        row.Cell(InvoiceDiffColNum).FormulaA1 <- $"{row.Cell(InvoiceTotalColNum).Address}-{actualTotalCell.Address}"
         )
         
     let run () =
