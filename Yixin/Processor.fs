@@ -1,5 +1,6 @@
 ﻿namespace Yixin
 
+open System.Collections.Generic
 open System.IO
 open System.Text.RegularExpressions
 open ClosedXML.Excel
@@ -10,12 +11,17 @@ module Processor =
           amount: float
           vendor: string
           codeType: string
+          invoiceName: string
           amountLocations: IXLAddress list
           invoiceLocation: IXLAddress }
             
     type PhaseWrapper =
         { phaseLoc: IXLAddress
           invoiceData: InvoiceData list }
+       
+    type VendorName = string
+    type PhaseCode = string
+    type InvoiceMap = Map<PhaseCode, Map<VendorName, PhaseWrapper>>
         
     [<Literal>]
     let ActualAmountColNum = 2
@@ -95,6 +101,7 @@ module Processor =
             { id = id
               amount = group |> Seq.sumBy (_.amount)
               vendor = firstInvoice.vendor
+              invoiceName = firstInvoice.invoiceName 
               codeType = firstInvoice.codeType
               invoiceLocation = firstInvoice.invoiceLocation 
               amountLocations = 
@@ -157,7 +164,7 @@ module Processor =
         let creditLoc = getColumnByName("Credit").Address.ColumnNumber
         let debitLoc = getColumnByName("Debit").Address.ColumnNumber
             
-        let addToNestedMap (phase: string) (vendor: string) (value: PhaseWrapper) (map: Map<string, Map<string, PhaseWrapper>>) =
+        let addToNestedMap (phase: string) (vendor: string) (value: PhaseWrapper) (map: InvoiceMap) =
             map
             |> Map.change phase (function
                 | Some innerMap ->
@@ -172,7 +179,7 @@ module Processor =
             )
             
         // create map phase -> vendor -> invoice list
-        let mutable outputMap: Map<string, Map<string, PhaseWrapper>> = Map.empty
+        let mutable outputMap: InvoiceMap = Map.empty
         
         let processRow (row : IXLRangeRow) =
             let phaseCode = getCellTextOrEmpty(row.Cell(phaseIdLoc))
@@ -182,9 +189,9 @@ module Processor =
                 let debit = getCellNumberOrZero (row.Cell(debitLoc))
                 let credit = getCellNumberOrZero (row.Cell(creditLoc))
                 let vendor = getCellTextOrEmpty (row.Cell(vendorLoc))
+                let doc = getCellTextOrEmpty (row.Cell(docLoc))
                 let invoiceId =
-                    let d = getCellTextOrEmpty (row.Cell(docLoc))
-                    let arr = d.Split(" ")
+                    let arr = doc.Split(" ")
                     match arr with
                     | [| invoice |] -> invoice
                     | _ when arr.Length > 1 -> arr[arr.Length - 1]
@@ -194,9 +201,9 @@ module Processor =
                 let entry =
                     match credit, debit with
                     | c, d when c > d ->
-                        {id = invoiceId; vendor = vendor; amount = debit + (credit * -1.0); invoiceLocation = invoiceLoc; amountLocations = [row.Cell(creditLoc).Address]; codeType = phaseCode }
+                        {id = invoiceId; invoiceName = doc; vendor = vendor; amount = debit + (credit * -1.0); invoiceLocation = invoiceLoc; amountLocations = [row.Cell(creditLoc).Address]; codeType = phaseCode }
                     | _ ->
-                        {id = invoiceId; vendor = vendor; amount = debit + (credit * -1.0); invoiceLocation = invoiceLoc; amountLocations = [row.Cell(debitLoc).Address]; codeType = phaseCode }
+                        {id = invoiceId; invoiceName = doc; vendor = vendor; amount = debit + (credit * -1.0); invoiceLocation = invoiceLoc; amountLocations = [row.Cell(debitLoc).Address]; codeType = phaseCode }
                         
                 outputMap <- addToNestedMap phaseCode vendor { phaseLoc = phaseLoc ; invoiceData = [entry]; } outputMap
             
@@ -207,7 +214,7 @@ module Processor =
         outputMap
        
         
-    let updateReport (reportSheet : IXLWorksheet) (invoiceMap : Map<string, Map<string,PhaseWrapper>>) =
+    let updateReport (reportSheet : IXLWorksheet) (invoiceMap : InvoiceMap) =
         let invoiceStartCol, invoiceRow, vendorRow = 5, 8, 9
         let mutable insertLoc = invoiceStartCol
         
@@ -293,13 +300,8 @@ module Processor =
             | _ when currentValueCount > 1 && cell.Address = endCopy -> 
                 reportSheet.Range(itStart, itEnd).Merge() |> ignore
             | _ -> ()
-                
-    let searchForExcelFiles directory =
-        Directory.GetFiles(directory, "*.xlsx")
-        
+            
     let applySumFormula ws =
-        
-        
         walkRows ws (fun row ->
             if row.Cell(ActualAmountColNum).Value.IsNumber then
                 match row.Cell(ActualAmountColNum).Value.GetNumber() with
@@ -318,16 +320,76 @@ module Processor =
                         row.Cell(InvoiceDiffColNum).FormulaA1 <- $"{row.Cell(InvoiceTotalColNum).Address}-{actualTotalCell.Address}"
         )
         
-    let run () =
-        let dir = Directory.GetCurrentDirectory()
-        let files = searchForExcelFiles dir
-        match files.Length with
-        | 0 -> printfn $"no valid files found in {dir}"
-        | _ -> printfn $"attempting to do work on file: {files[0]}"
+    let buildVendorSheet (ws : IXLWorksheet) (invoiceMap : InvoiceMap) =
+        let vendorMap = Dictionary<VendorName, HashSet<string>>()
+        for phaseMap in invoiceMap do
+            for KeyValue(vendorName, phaseWrapper) in phaseMap.Value do
+                let invoiceNames = 
+                    match vendorMap.TryGetValue(vendorName) with
+                    | true, hashSet -> hashSet
+                    | false, _ ->
+                        let newHashSet = HashSet<string>()
+                        vendorMap.Add(vendorName, newHashSet)
+                        newHashSet
+
+                for data in phaseWrapper.invoiceData do
+                    invoiceNames.Add(data.invoiceName) |> ignore
+                
+            let mutable currentRow = 1
+            for vendor in vendorMap do
+                for invoice in vendorMap[vendor.Key] do
+                    ws.Cell(currentRow, 1).Value <- vendor.Key
+                    ws.Cell(currentRow, 2).Value <- invoice
+                    currentRow <- currentRow + 1
+                
+        ws.Columns().AdjustToContents() |> ignore
         
-        use workbook = new XLWorkbook(files[0])
+    let run (filePath : string) (outputPath : string) =
+        let dir =
+            if Directory.Exists(filePath) then
+                filePath
+            elif File.Exists(filePath) then
+                Path.GetDirectoryName(filePath)
+            else
+                printfn $"invalid input path was given: {filePath}"
+                exit -1
+        
+        
+        let files = Directory.GetFiles(dir, "*.xlsx")
+        let selectedFile =
+            match files.Length with
+            | 0 ->
+                printfn $"no valid files found in {dir}"
+                ""
+            | _ ->
+                printfn "Select a file to process"
+                Seq.iteri (fun i file -> printfn $"{i+1}: {Path.GetFileName(file : string)}") files
+                let mutable selectedFile = ""
+                while selectedFile = "" do
+                    try
+                        printf "enter selection: "
+                        let selection = System.Console.ReadLine().Trim() |> int
+                        if selection < files.Length then
+                            selectedFile <- files[selection-1]
+                        else
+                            printfn "invalid selection"
+                        
+                    with 
+                    | :? System.FormatException -> 
+                        printfn "invalid selection"
+                selectedFile
+                
+        if selectedFile.Length <= 0 then
+            printfn "no file selected, exiting"
+            exit(-1)
+            
+        printfn $"starting work on file: {selectedFile}"
+        
+        
+        use workbook = new XLWorkbook(selectedFile)
         let reportSheet = workbook.Worksheets.Worksheet(1)
         let glSheet = workbook.Worksheets.Worksheet(2)
+        let vendorSheet = workbook.Worksheets.Add(Constants.VendorInvoicesSheet : string)
         printfn "successfully loaded workbook"
         
         // processing pipeline
@@ -335,9 +397,10 @@ module Processor =
         let invoiceMap = findRelatedInvoices glSheet nonZeroMap
         updateReport reportSheet invoiceMap
         applySumFormula reportSheet
+        buildVendorSheet vendorSheet invoiceMap
         
-        let fileName = "sheet-builder-output.xlsx"
-        let fileFull = Path.Join(dir, fileName)
+        let fileName = $"{Path.GetFileNameWithoutExtension(selectedFile)}-processed.xlsx"
+        let fileFull = Path.Join(outputPath, fileName)
         printfn $"finished processing, saving to: {fileFull}"
             
         workbook.SaveAs(fileFull) 

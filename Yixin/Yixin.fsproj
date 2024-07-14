@@ -6,11 +6,18 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Compile Include="Constants.fs" />
+        <Compile Include="Components/FileSelector.fs" />
         <Compile Include="Processor.fs" />
+        <Compile Include="InvoicesDirectoryBuilder.fs" />
+        <Compile Include="View.fs" />
         <Compile Include="Program.fs"/>
     </ItemGroup>
 
     <ItemGroup>
+      <PackageReference Include="Avalonia.FuncUI" Version="1.4.0" />
+      <PackageReference Include="Avalonia.FuncUI.Elmish" Version="1.4.0" />
+      <PackageReference Include="Avalonia.Themes.Fluent" Version="11.1.0-rc2" />
       <PackageReference Include="ClosedXML" Version="0.102.2" />
     </ItemGroup>
 
